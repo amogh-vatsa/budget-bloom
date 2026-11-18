@@ -80,6 +80,13 @@ def init_db() -> None:
                 limit_amount REAL NOT NULL CHECK(limit_amount > 0),
                 UNIQUE(category, month)
             );
+            CREATE TABLE IF NOT EXISTS savings_goals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                target REAL NOT NULL CHECK(target > 0),
+                saved REAL NOT NULL DEFAULT 0 CHECK(saved >= 0),
+                created_on TEXT NOT NULL
+            );
         """)
         if con.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 0:
             today = date.today()
@@ -115,8 +122,18 @@ def dashboard():
         datetime.strptime(selected_month, "%Y-%m")
     except ValueError:
         selected_month = date.today().strftime("%Y-%m")
+    search = request.args.get("q", "").strip()[:80]
+    category_filter = request.args.get("category", "")
+    kind_filter = request.args.get("kind", "")
+    start_date, end_date = request.args.get("from", ""), request.args.get("to", "")
+    try:
+        if start_date: date.fromisoformat(start_date)
+        if end_date: date.fromisoformat(end_date)
+    except ValueError:
+        start_date = end_date = ""
     with db() as con:
         rows = con.execute("SELECT * FROM transactions WHERE substr(happened_on,1,7)=? ORDER BY happened_on DESC,id DESC", (selected_month,)).fetchall()
+        filtered = con.execute("SELECT * FROM transactions WHERE substr(happened_on,1,7)=? AND (?='' OR description LIKE ?) AND (?='' OR category=?) AND (?='' OR kind=?) AND (?='' OR happened_on>=?) AND (?='' OR happened_on<=?) ORDER BY happened_on DESC,id DESC", (selected_month, search, f"%{search}%", category_filter, category_filter, kind_filter, kind_filter, start_date, start_date, end_date, end_date)).fetchall()
         income_total = sum(r["amount"] for r in rows if r["kind"] == "income")
         expense_total = sum(r["amount"] for r in rows if r["kind"] == "expense")
         budgets = con.execute("SELECT * FROM budgets WHERE month=? ORDER BY category", (selected_month,)).fetchall()
@@ -127,7 +144,37 @@ def dashboard():
             spent = spending.get(b["category"], 0)
             budget_cards.append({"category": b["category"], "limit": model.limit, "spent": spent, "left": max(model.limit-spent, 0), "progress": model.progress(spent), "over": spent > model.limit})
         category_totals = sorted(spending.items(), key=lambda pair: pair[1], reverse=True)
-    return render_template("dashboard.html", month=selected_month, transactions=rows, income=income_total, expenses=expense_total, balance=income_total-expense_total, budgets=budget_cards, categories=category_totals)
+        prior = con.execute("SELECT kind,SUM(amount) total FROM transactions WHERE substr(happened_on,1,7)=? GROUP BY kind", ((date.fromisoformat(selected_month+"-01").replace(day=1).toordinal()-1),)).fetchall()
+        month_date = date.fromisoformat(selected_month+"-01")
+        prev_month_date = date(month_date.year-1,12,1) if month_date.month == 1 else date(month_date.year,month_date.month-1,1)
+        prior = con.execute("SELECT kind,SUM(amount) total FROM transactions WHERE substr(happened_on,1,7)=? GROUP BY kind", (prev_month_date.strftime("%Y-%m"),)).fetchall()
+        prev = {r["kind"]: r["total"] or 0 for r in prior}
+        goals = con.execute("SELECT * FROM savings_goals ORDER BY id DESC").fetchall()
+    return render_template("dashboard.html", month=selected_month, transactions=filtered, income=income_total, expenses=expense_total, balance=income_total-expense_total, budgets=budget_cards, categories=category_totals, search=search, category_filter=category_filter, kind_filter=kind_filter, start_date=start_date, end_date=end_date, previous=prev, goals=goals)
+
+
+@app.post("/transactions/<int:transaction_id>/edit")
+def edit_transaction(transaction_id):
+    try:
+        kind=request.form.get("kind", "expense"); category=request.form.get("category", "Other")
+        amount=float(request.form.get("amount", "0")); happened=date.fromisoformat(request.form.get("happened_on", "")); description=request.form.get("description", "").strip()
+        if kind not in {"income","expense"} or category not in (CATEGORIES if kind=="income" else EXPENSE_CATEGORIES) or not description: raise ValueError("Check the transaction details.")
+        model=(Income if kind=="income" else Expense)(amount,category,description,happened)
+        with db() as con: con.execute("UPDATE transactions SET kind=?,amount=?,category=?,description=?,happened_on=? WHERE id=?",(kind,model.amount,category,description,happened.isoformat(),transaction_id))
+        flash("Transaction updated.","success")
+    except (ValueError,TypeError) as exc: flash(str(exc) or "Enter valid transaction details.","error")
+    return redirect(url_for("dashboard",month=request.form.get("month",date.today().strftime("%Y-%m"))))
+
+
+@app.post("/goals")
+def add_goal():
+    try:
+        name=request.form.get("name","").strip(); target=float(request.form.get("target","0")); saved=float(request.form.get("saved","0"))
+        if not name or target<=0 or saved<0: raise ValueError("Enter a name, positive target, and nonnegative saved amount.")
+        with db() as con: con.execute("INSERT INTO savings_goals(name,target,saved,created_on) VALUES(?,?,?,?)",(name[:60],target,saved,date.today().isoformat()))
+        flash("Savings goal added.","success")
+    except (ValueError,TypeError) as exc: flash(str(exc),"error")
+    return redirect(url_for("dashboard",month=request.form.get("month",date.today().strftime("%Y-%m"))))
 
 
 @app.post("/transactions")
